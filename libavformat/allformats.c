@@ -160,6 +160,7 @@ void av_register_all(void)
     REGISTER_DEMUXER (LXF,              lxf);
     REGISTER_MUXDEMUX(M4V,              m4v);
     REGISTER_MUXER   (MD5,              md5);
+    REGISTER_MUXDEMUX(MADJ,             madj);
     REGISTER_MUXDEMUX(MATROSKA,         matroska);
     REGISTER_MUXER   (MATROSKA_AUDIO,   matroska_audio);
     REGISTER_DEMUXER (MGSTS,            mgsts);

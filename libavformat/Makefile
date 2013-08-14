@@ -198,6 +198,8 @@ OBJS-$(CONFIG_LVF_DEMUXER)               += lvfdec.o
 OBJS-$(CONFIG_LXF_DEMUXER)               += lxfdec.o
 OBJS-$(CONFIG_M4V_DEMUXER)               += m4vdec.o rawdec.o
 OBJS-$(CONFIG_M4V_MUXER)                 += rawenc.o
+OBJS-$(CONFIG_MADJ_DEMUXER)              += madj.o
+OBJS-$(CONFIG_MADJ_MUXER)                += madj.o
 OBJS-$(CONFIG_MATROSKA_DEMUXER)          += matroskadec.o matroska.o  \
                                             isom.o rmsipr.o
 OBJS-$(CONFIG_MATROSKA_MUXER)            += matroskaenc.o matroska.o \
