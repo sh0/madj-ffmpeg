@@ -42,8 +42,7 @@ typedef struct {
     uint64_t num_frames;
     uint64_t num_subframes;
     uint64_t data_offset;
-    uint32_t rate_n;
-    uint32_t rate_d;
+    AVRational rate;
 
     // Codec info
     uint32_t codec_type;
@@ -53,6 +52,10 @@ typedef struct {
     
     // Index
     uint8_t* index;
+    
+    // Playback
+    double play_rate;
+    uint64_t play_frame;
 } MadjTrack;
 
 static int madj_read_string(AVIOContext *pb, char** str)
@@ -149,8 +152,8 @@ static int madj_read_header(AVFormatContext *s)
         track->num_frames = avio_rb64(madj->ctx->pb);
         track->num_subframes = avio_rb64(madj->ctx->pb);
         track->data_offset = avio_rb64(madj->ctx->pb);
-        track->rate_n = avio_rb32(madj->ctx->pb);
-        track->rate_d = avio_rb32(madj->ctx->pb);
+        track->rate.num = avio_rb32(madj->ctx->pb);
+        track->rate.den = avio_rb32(madj->ctx->pb);
         
         // Codec info
         track->codec_type = avio_rb32(madj->ctx->pb);
@@ -181,6 +184,10 @@ static int madj_read_header(AVFormatContext *s)
             err = AVERROR(EIO);
             goto error;
         }
+        
+        // Playback
+        track->play_rate = av_q2d(track->rate);
+        track->play_frame = 0;
     }
     
     // Tracks
@@ -199,8 +206,8 @@ static int madj_read_header(AVFormatContext *s)
         stream->priv_data = track;
         
         // Generic properties
-        stream->time_base.num = track->rate_n;
-        stream->time_base.den = track->rate_d;
+        stream->time_base.num = track->rate.num;
+        stream->time_base.den = track->rate.den;
         stream->start_time = 0;
         stream->duration = track->num_frames * track->num_subframes;
         stream->nb_frames = track->num_frames * track->num_subframes;
@@ -256,6 +263,59 @@ static int madj_read_header(AVFormatContext *s)
 
 static int madj_read_packet(AVFormatContext *s, AVPacket *pkt)
 {
+    // Variables
+    uint8_t* index = NULL;
+    uint64_t offset = 0;
+    uint64_t size = 0;
+    
+    // Context
+    MadjDemuxContext *madj = s->priv_data;
+    
+    // Get stream with lowest play position
+    MadjTrack* track = NULL;
+    int track_id = 0;
+    double track_time = 0;
+    for (int i = 0; i < madj->track_num; i++) {
+        if (madj->track[i].play_frame < madj->track[i].num_frames) {
+            double ct = madj->track[i].play_rate;
+            ct *= madj->track[i].play_frame * madj->track[i].num_subframes;
+            if (track == NULL || track_time > ct) {
+                track = &madj->track[i];
+                track_id = i;
+                track_time = ct;
+            }
+        }
+    }
+    if (!track)
+        return AVERROR_EOF;
+    
+    // Index data
+    index = track->index + (track->play_frame * 8);
+    
+    // Offset and size
+    for (int i = 3; i < 8; i++) {
+        offset <<= 8;
+        offset |= index[i];
+    }
+    offset += track->data_offset;
+    size = ((uint64_t)index[0] << 16) | ((uint64_t)index[1] << 8) | ((uint64_t)index[2]);
+    
+    // Packet info
+    av_new_packet(pkt, size);
+    pkt->pts = track->play_frame;
+    pkt->dts = track->play_frame;
+    pkt->stream_index = track_id;
+    pkt->duration = track->num_subframes;
+    pkt->pos = offset;
+    
+    // Read packet
+    avio_seek(madj->ctx->pb, offset, SEEK_SET);
+    avio_read(madj->ctx->pb, pkt->data, size);
+    
+    // Increase frame counter
+    track->play_frame++;
+    
+    // Success
     return 0;
 }
 
