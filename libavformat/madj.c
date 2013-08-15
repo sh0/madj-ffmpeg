@@ -24,6 +24,7 @@
 #include "avio_internal.h"
 
 #include "libavutil/opt.h"
+#include "libavutil/avstring.h"
 #include "libavutil/intreadwrite.h"
 
 /*** Macros *******************************************************************/
@@ -37,6 +38,12 @@
 #define MADJ_PARAM_I64 1
 
 /*** Generic ******************************************************************/
+typedef struct {
+    uint32_t size;
+    uint64_t offset;
+    uint8_t* data;
+} MadjChunk;
+
 typedef struct {
     // Frame info
     uint64_t num_frames;
@@ -53,12 +60,17 @@ typedef struct {
     // Index
     uint8_t* index;
     
-    // Playback
-    double play_rate;
-    uint64_t play_frame;
+    // Decoding
+    double decode_rate;
+    uint64_t decode_frame;
+    
+    // Encoding
+    uint32_t encode_num;
+    uint64_t encode_offset;
+    MadjChunk** encode_data;
 } MadjTrack;
 
-static int madj_read_string(AVIOContext *pb, char** str)
+static int madj_read_string(AVIOContext* pb, char** str)
 {
     uint16_t str_len = avio_rb16(pb);
     *str = av_malloc(str_len + 1);
@@ -69,6 +81,14 @@ static int madj_read_string(AVIOContext *pb, char** str)
         return AVERROR(EIO);
     }
     str[str_len] = '\0';
+    return 0;
+}
+
+static int madj_write_string(AVIOContext* pb, char* str)
+{
+    uint16_t str_len = strlen(str);
+    avio_wb16(pb, str_len);
+    avio_write(pb, str, str_len);
     return 0;
 }
 
@@ -94,6 +114,12 @@ static void madj_dict_get_int_nz(AVDictionary* m, const char* key, int* value)
     madj_dict_get_int(m, key, &v);
     if (v != 0)
         *value = v;
+}
+
+static void madj_dict_set_int(AVDictionary** pm, const char* key, int value)
+{
+    char* str = av_asprintf("%d", value);
+    av_dict_set(pm, key, str, AV_DICT_DONT_STRDUP_VAL);
 }
 
 /*** Demuxer ******************************************************************/
@@ -186,8 +212,8 @@ static int madj_read_header(AVFormatContext *s)
         }
         
         // Playback
-        track->play_rate = av_q2d(track->rate);
-        track->play_frame = 0;
+        track->decode_rate = av_q2d(track->rate);
+        track->decode_frame = 0;
     }
     
     // Tracks
@@ -218,6 +244,7 @@ static int madj_read_header(AVFormatContext *s)
             AVCodecContext* codec = stream->codec;
             codec->codec_type = AVMEDIA_TYPE_VIDEO;
             codec->codec_tag = track->codec_id;
+            codec->codec_id = track->codec_id;
             
             madj_dict_get_int_nz(track->param, "frame_width", &codec->width);
             madj_dict_get_int_nz(track->param, "frame_height", &codec->height);
@@ -239,9 +266,10 @@ static int madj_read_header(AVFormatContext *s)
             AVCodecContext* codec = stream->codec;
             codec->codec_type = AVMEDIA_TYPE_AUDIO;
             codec->codec_tag = track->codec_id;
+            codec->codec_id = track->codec_id;
             
             madj_dict_get_int_nz(track->param, "sample_rate", &codec->sample_rate);
-            madj_dict_get_int_nz(track->param, "channles", &codec->channels);
+            madj_dict_get_int_nz(track->param, "channels", &codec->channels);
             madj_dict_get_int_nz(track->param, "bit_depth", &codec->bits_per_coded_sample);
             
         } else {
@@ -276,9 +304,9 @@ static int madj_read_packet(AVFormatContext *s, AVPacket *pkt)
     int track_id = 0;
     double track_time = 0;
     for (int i = 0; i < madj->track_num; i++) {
-        if (madj->track[i].play_frame < madj->track[i].num_frames) {
-            double ct = madj->track[i].play_rate;
-            ct *= madj->track[i].play_frame * madj->track[i].num_subframes;
+        if (madj->track[i].decode_frame < madj->track[i].num_frames) {
+            double ct = madj->track[i].decode_rate;
+            ct *= madj->track[i].decode_frame * madj->track[i].num_subframes;
             if (track == NULL || track_time > ct) {
                 track = &madj->track[i];
                 track_id = i;
@@ -290,20 +318,23 @@ static int madj_read_packet(AVFormatContext *s, AVPacket *pkt)
         return AVERROR_EOF;
     
     // Index data
-    index = track->index + (track->play_frame * 8);
+    index = track->index + (track->decode_frame * 8);
     
     // Offset and size
-    for (int i = 3; i < 8; i++) {
+    for (int i = 0; i < 3; i++) {
+        size <<= 8;
+        size |= index[i];
+    }
+    for (int i = 0; i < 5; i++) {
         offset <<= 8;
-        offset |= index[i];
+        offset |= index[i + 3];
     }
     offset += track->data_offset;
-    size = ((uint64_t)index[0] << 16) | ((uint64_t)index[1] << 8) | ((uint64_t)index[2]);
     
     // Packet info
     av_new_packet(pkt, size);
-    pkt->pts = track->play_frame;
-    pkt->dts = track->play_frame;
+    pkt->pts = track->decode_frame;
+    pkt->dts = track->decode_frame;
     pkt->stream_index = track_id;
     pkt->duration = track->num_subframes;
     pkt->pos = offset;
@@ -313,7 +344,7 @@ static int madj_read_packet(AVFormatContext *s, AVPacket *pkt)
     avio_read(madj->ctx->pb, pkt->data, size);
     
     // Increase frame counter
-    track->play_frame++;
+    track->decode_frame++;
     
     // Success
     return 0;
@@ -342,6 +373,31 @@ static int madj_read_close(AVFormatContext *s)
 static int madj_read_seek(AVFormatContext *s, int stream_index,
                           int64_t timestamp, int flags)
 {
+    // Context
+    MadjDemuxContext *madj = s->priv_data;
+    
+    // Time
+    double ts = 0;
+    
+    // Mode selection
+    if (stream_index < 0) {
+        ts = (double)timestamp / (double)AV_TIME_BASE;
+    } else {
+        MadjTrack* track;
+        if (stream_index >= madj->track_num)
+            return -1;
+        track = &madj->track[stream_index];
+        ts = track->decode_rate * (double)timestamp + (track->decode_rate / 10.0);
+    }
+    
+    // Seeks
+    for (int i = 0; i < madj->track_num; i++) {
+        MadjTrack* track = &madj->track[i];
+        track->decode_frame = ts / track->decode_rate;
+        track->decode_frame /= track->num_subframes;
+    }
+
+    // Success
     return 0;
 }
 
@@ -358,27 +414,203 @@ AVInputFormat ff_madj_demuxer = {
 
 /*** Muxer ********************************************************************/
 typedef struct MadjMuxContext {
-    const AVClass *class;
-    AVIOContext *dyn_bc;
+    // Context
+    const AVClass* class;
+    AVFormatContext *ctx;
+    
+    // Tracks
+    uint32_t track_num;
+    MadjTrack* track;
 } MadjMuxContext;
 
 static int madj_write_header(AVFormatContext *s)
 {
+    // Context
+    MadjMuxContext *madj = s->priv_data;
+    memset(madj, 0, sizeof(MadjMuxContext));
+    madj->ctx = s;
+    
+    // Populate tracks
+    madj->track_num = madj->ctx->nb_streams;
+    madj->track = av_mallocz(madj->track_num * sizeof(MadjTrack));
+    for (int i = 0; i < madj->track_num; i++) {
+        // Track and stream
+        MadjTrack* track = &madj->track[i];
+        AVStream* stream = madj->ctx->streams[i];
+        AVCodecContext* codec = stream->codec;
+        
+        // Frame info
+        track->rate = stream->time_base;
+        track->num_subframes = 1;
+        
+        // Codec info
+        if (codec->codec_type == AVMEDIA_TYPE_VIDEO) {
+            // Video stream
+            track->codec_type = MADJ_CODEC_VIDEO;
+            track->codec_id = codec->codec_id;
+            
+            madj_dict_set_int(&track->param, "frame_width", codec->width);
+            madj_dict_set_int(&track->param, "frame_height", codec->height);
+            {
+                AVRational sar = stream->sample_aspect_ratio;
+                int display_width = av_rescale(codec->width, sar.num, sar.den);
+                int display_height = av_rescale(codec->height, sar.num, sar.den);
+                madj_dict_set_int(&track->param, "display_width", display_width);
+                madj_dict_set_int(&track->param, "display_height", display_height);
+            }
+            track->param_num = av_dict_count(track->param);
+            
+        } else if (codec->codec_type == AVMEDIA_TYPE_AUDIO) {
+            // Audio stream
+            track->codec_type = MADJ_CODEC_AUDIO;
+            track->codec_id = codec->codec_id;
+            
+            madj_dict_set_int(&track->param, "sample_rate", codec->sample_rate);
+            madj_dict_set_int(&track->param, "channels", codec->channels);
+            madj_dict_set_int(&track->param, "bit_depth", codec->bits_per_coded_sample);
+            track->param_num = av_dict_count(track->param);
+            
+            track->num_subframes = codec->frame_size * codec->channels;
+            
+        } else {
+            // Unsupported type
+            return -1;
+        }
+    }
+    
+    // Success
     return 0;
 }
 
 static int madj_write_packet(AVFormatContext *s, AVPacket *pkt)
 {
+    // Context
+    MadjMuxContext* madj = s->priv_data;
+    MadjTrack* track = &madj->track[pkt->stream_index];
+    
+    // Chunk
+    MadjChunk* chunk = av_mallocz(sizeof(MadjChunk));
+    chunk->offset = track->encode_offset;
+    chunk->size = pkt->size;
+    chunk->data = av_memdup(pkt->data, pkt->size);
+    
+    // Track
+    track->encode_offset += chunk->size;
+    av_dynarray_add(&track->encode_data, &track->encode_num, chunk);
+    
+    // Success
     return 0;
 }
 
 static int madj_write_trailer(AVFormatContext *s)
 {
+    // Context
+    MadjMuxContext* madj = s->priv_data;
+    
+    // Offsets
+    uint64_t header_offset = 0;
+    uint64_t data_offset = 0;
+    
+    // Finalize tracks
+    for (int i = 0; i < madj->track_num; i++) {
+        // Track
+        MadjTrack* track = &madj->track[i];
+        
+        // Frame info
+        track->num_frames = track->encode_num;
+        track->data_offset = data_offset;
+        
+        // Offsets
+        header_offset += 4 * 8; // frame info
+        header_offset += 3 * 4; // codec info
+        {
+            AVDictionaryEntry* t = NULL;
+            while (t = av_dict_get(track->param, "", t, AV_DICT_IGNORE_SUFFIX)) {
+                header_offset += 2 + strlen(t->key);
+                header_offset += 2 + strlen(t->value);
+            }
+        }
+        header_offset += track->num_frames * 8; // index
+        data_offset += track->encode_offset;
+        
+        // Index
+        track->index = av_malloc(track->num_frames * 8);
+        for (int j = 0; j < track->num_frames; j++) {
+            uint8_t* index = track->index + (j * 8);
+            uint32_t size = track->encode_data[j]->size;
+            uint64_t offset = track->encode_data[j]->offset;
+            for (int k = 0; k < 3; k++) {
+                index[2 - k] = (size & 0xff);
+                size >>= 8;
+            }
+            for (int k = 0; k < 5; k++) {
+                index[7 - k] = (offset & 0xff);
+                offset >>= 8;
+            }
+        }
+    }
+    
+    // Fix offsets
+    for (int i = 0; i < madj->track_num; i++)
+        madj->track[i].data_offset += header_offset;
+    
+    // Write tag and version
+    avio_wb32(madj->ctx->pb, MADJ_ID_TAG);
+    avio_wb32(madj->ctx->pb, MADJ_ID_VERSION);
+    
+    // Write track info
+    avio_wb32(madj->ctx->pb, madj->track_num);
+    for (int i = 0; i < madj->track_num; i++) {
+        // Track
+        MadjTrack* track = &madj->track[i];
+        
+        // Frame info
+        avio_wb64(madj->ctx->pb, track->num_frames);
+        avio_wb64(madj->ctx->pb, track->num_subframes);
+        avio_wb64(madj->ctx->pb, track->data_offset);
+        avio_wb32(madj->ctx->pb, track->rate.num);
+        avio_wb32(madj->ctx->pb, track->rate.den);
+
+        // Codec info
+        avio_wb32(madj->ctx->pb, track->codec_type);
+        avio_wb32(madj->ctx->pb, track->codec_id);
+        avio_wb32(madj->ctx->pb, track->param_num);
+        {
+            AVDictionaryEntry* t = NULL;
+            while (t = av_dict_get(track->param, "", t, AV_DICT_IGNORE_SUFFIX)) {
+                madj_write_string(madj->ctx->pb, t->key);
+                madj_write_string(madj->ctx->pb, t->value);
+            }
+        }
+        
+        // Index
+        avio_write(madj->ctx->pb, track->index, track->num_frames * 8);
+    }
+    
+    // Write data
+    for (int i = 0; i < madj->track_num; i++) {
+        // Track
+        MadjTrack* track = &madj->track[i];
+        
+        // Chunks
+        for (int j = 0; j < track->encode_num; j++) {
+            MadjChunk* chunk = track->encode_data[j];
+            avio_write(madj->ctx->pb, chunk->data, chunk->size);
+        }
+    }
+    
+    // Success
     return 0;
 }
 
 static int madj_query_codec(enum AVCodecID codec_id, int std_compliance)
 {
+    // Allow all video and audio codeces for now
+    enum AVMediaType type = avcodec_get_type(codec_id);
+    if (type == AVMEDIA_TYPE_VIDEO || type == AVMEDIA_TYPE_AUDIO)
+        return 1;
+    
+    // Failure
     return 0;
 }
 
