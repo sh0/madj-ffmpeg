@@ -34,7 +34,7 @@
 
 #define MADJ_CODEC_VIDEO 0
 #define MADJ_CODEC_AUDIO 1
-#define MADJ_HEADER_SIZE_VIDEO 16
+#define MADJ_HEADER_SIZE_VIDEO 20
 #define MADJ_HEADER_SIZE_AUDIO 12
 
 /*** Generic ******************************************************************/
@@ -49,6 +49,7 @@ typedef struct {
     uint32_t height;
     uint32_t display_width;
     uint32_t display_height;
+    uint32_t pixfmt;
 } MadjVideo;
 
 typedef struct {
@@ -158,6 +159,7 @@ static int madj_read_header(AVFormatContext* s)
             video->height = avio_rb32(madj->ctx->pb);
             video->display_width = avio_rb32(madj->ctx->pb);
             video->display_height = avio_rb32(madj->ctx->pb);
+            video->pixfmt = avio_rb32(madj->ctx->pb);
 
         } else if (track->codec_type == MADJ_CODEC_AUDIO) {
             // Audio track
@@ -245,15 +247,15 @@ static int madj_read_header(AVFormatContext* s)
                           codec->width * track->codec_video.display_height,
                           255);
             }
-        
-            /*
-            AVDictionaryEntry* entry = madj_dict_find(track->param, "pix_fmt");
-            if (entry) {
-                enum AVPixelFormat pix_fmt;
-                if ((pix_fmt = av_get_pix_fmt(entry->value)) != AV_PIX_FMT_NONE)
-                    codec->pix_fmt = pix_fmt;
+
+            if (track->codec_video.pixfmt != 0) {
+                for (int i = AV_PIX_FMT_NONE; i < AV_PIX_FMT_NB; i++) {
+                    if (avcodec_pix_fmt_to_codec_tag(i) == track->codec_video.pixfmt) {
+                        codec->pix_fmt = i;
+                        break;
+                    }
+                }
             }
-            */
             
         } else if (track->codec_type == MADJ_CODEC_AUDIO) {
             // Audio codec
@@ -460,17 +462,12 @@ static int madj_write_header(AVFormatContext *s)
             
             track->codec_video.width = codec->width;
             track->codec_video.height = codec->height;
-
             {
                 AVRational sar = stream->sample_aspect_ratio;
                 track->codec_video.display_width = av_rescale(codec->width, sar.num, sar.den);
                 track->codec_video.display_height = av_rescale(codec->height, sar.num, sar.den);
             }
-            /*
-            const char* pix_fmt = av_get_pix_fmt_name(codec->pix_fmt);
-            if (pix_fmt)
-                madj_dict_set_string(&track->param, "pix_fmt", pix_fmt);
-            */
+            track->codec_video.pixfmt = avcodec_pix_fmt_to_codec_tag(codec->pix_fmt);
             
         } else if (codec->codec_type == AVMEDIA_TYPE_AUDIO) {
             // Audio stream
@@ -588,6 +585,7 @@ static int madj_write_trailer(AVFormatContext *s)
             avio_wb32(madj->ctx->pb, track->codec_video.height);
             avio_wb32(madj->ctx->pb, track->codec_video.display_width);
             avio_wb32(madj->ctx->pb, track->codec_video.display_height);
+            avio_wb32(madj->ctx->pb, track->codec_video.pixfmt);
         } else if (track->codec_type == MADJ_CODEC_AUDIO) {
             avio_wb32(madj->ctx->pb, track->codec_audio.sample_rate);
             avio_wb32(madj->ctx->pb, track->codec_audio.channels);
