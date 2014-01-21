@@ -349,6 +349,14 @@ static int madj_read_packet(AVFormatContext *s, AVPacket *pkt)
     pkt->dts = track->decode_frame;
     pkt->stream_index = track_id;
     pkt->duration = track->num_subframes;
+
+    // Debug
+    /*
+    FILE* fs = fopen("temp.jpg", "wb");
+    fwrite(pkt->data, pkt->size, 1, fs);
+    fclose(fs);
+    exit(0);
+    */
     
     // Increase frame counter
     track->decode_frame++;
@@ -530,7 +538,7 @@ static int madj_write_trailer(AVFormatContext *s)
         
         // Offsets
         header_offset += 4 * 8; // frame info
-        header_offset += 3 * 4; // codec info
+        header_offset += 2 * 4; // codec info
         if (track->codec_type == MADJ_CODEC_VIDEO) {
             header_offset += MADJ_HEADER_SIZE_VIDEO; // video header
         } else if (track->codec_type == MADJ_CODEC_AUDIO) {
