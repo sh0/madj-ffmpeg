@@ -612,10 +612,14 @@ static int madj_write_trailer(AVFormatContext *s)
     return 0;
 }
 
+#define MADJ_VIDEO_CODEC_ID AV_CODEC_ID_MJPEG
+#define MADJ_AUDIO_CODEC_ID AV_CODEC_ID_MP3
+//AV_CODEC_ID_PCM_S16BE
+
 static int madj_query_codec(enum AVCodecID codec_id, int std_compliance)
 {
     // Allow only PCM and MJPEG formats
-    if (codec_id == AV_CODEC_ID_PCM_S16BE || codec_id == AV_CODEC_ID_MJPEG)
+    if (codec_id == MADJ_AUDIO_CODEC_ID || codec_id == MADJ_VIDEO_CODEC_ID)
         return 1;
     
     // Failure
@@ -651,8 +655,8 @@ AVOutputFormat ff_madj_muxer = {
     .mime_type         = "video/x-madj",
     .extensions        = "mjv",
     .priv_data_size    = sizeof(MadjMuxContext),
-    .audio_codec       = AV_CODEC_ID_PCM_S16BE,
-    .video_codec       = AV_CODEC_ID_MJPEG,
+    .audio_codec       = MADJ_AUDIO_CODEC_ID,
+    .video_codec       = MADJ_VIDEO_CODEC_ID,
     .write_header      = madj_write_header,
     .write_packet      = madj_write_packet,
     .write_trailer     = madj_write_trailer,
